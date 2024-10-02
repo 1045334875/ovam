@@ -1,97 +1,139 @@
 from typing import TYPE_CHECKING, Callable, Optional, Union
-
 import torch
+import numpy as np
+import time
+import random
+import argparse
+import daam
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+from PIL import Image
+# Import the OVAM library
+from ovam import StableDiffusionHooker
+from ovam.utils import set_seed, get_device
+from ovam.optimize import optimize_embedding
+from ovam.utils.dcrf import densecrf
+from diffusers import StableDiffusionPipeline
+from transformers import CLIPTextModel, CLIPTokenizer
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 
 if TYPE_CHECKING:
     from ..base.daam_module import DAAMModule
 
-def optimize_embedding(
-    daam_module: "DAAMModule",
-    embedding: "torch.Tensor",
-    target: "torch.Tensor",
-    device: Optional[str] = None,
-    callback: Optional[Callable] = None,
-    initial_lr: float = 300,
-    epochs: int = 1000,
-    step_size: int = 80,
-    gamma: float = 0.7,
-    apply_min_max: Union[bool, int] = 3720,
-    squeezed_target: bool = False,
-) -> "torch.Tensor":
-    
-    # Infer the device
-    device = embedding.device if device is None else device
+def normalize(sa):
+    sa = (sa - sa.min()) / (sa.max() - sa.min())
+    return sa
 
-    # x is Trigger
-    # Clone the embedding as a trainable tensor
-    tri = embedding.detach().clone().requires_grad_(True)
-    tri.retain_grad()
-    tri.to(device)
-    # Move the target to the device
-    target.to(device)
+def main():
+    # -----------------------------Prepare model-----------------------------------
+    # args = parse_args()
+    pretrained_model_name_or_path="/home/data/huggingface/Pretrained_model_files/sd_v1-4"
+    pre_unet_path="/home/tangyao/BadT2I/laion_pixel_boya_unet_bsz4_step4_sks"
+    revision=None
+    vae = AutoencoderKL.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="vae",
+            revision=revision,
+            low_cpu_mem_usage=False,
+        )
+    text_encoder = CLIPTextModel.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=revision,
+            low_cpu_mem_usage=True,
+        )
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #         pretrained_model_name_or_path, subfolder="tokenizer", revision=revision, low_cpu_mem_usage=True,
+    #     )
+    # noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler",
+    #                                                     low_cpu_mem_usage=False, )
+    unet = UNet2DConditionModel.from_pretrained(
+            pre_unet_path,
+            revision=revision,
+            low_cpu_mem_usage=False,
+        )
+    # Unet2D conditionModel 可以直接加timestep
+    pipe = StableDiffusionPipeline.from_pretrained(
+                pretrained_model_name_or_path,
+                text_encoder=text_encoder,
+                vae=vae,
+                unet=unet,
+                revision=revision,
+                low_cpu_mem_usage=False,
+            )
+
+    device = get_device()
+    pipe = pipe.to(device)
+    
+    
+    initial_lr: float = 300
+    step_size: int = 80
+    epochs: int = 10
+    gamma: float = 0.7
+    train_batch_size: int = 1
+    print("Finish load trigger")
 
     # Define the optimizer, scheduler and loss function
-    optimizer = optim.SGD([tri], lr=initial_lr)
+    optimizer = optim.SGD([Trigger], lr=initial_lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-    loss_fn = nn.BCELoss(reduction="mean")
+    # loss_fn = nn.BCELoss(reduction="mean")
     loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    Trigger = 'sks'
 
-    
+        
+    # -----------------------------Prepare trigger-----------------------------------
+    with StableDiffusionHooker(pipe) as hooker:
+        set_seed(123456)
+        embedding1 = hooker.get_ovam_callable(expand_size=(512,512)).encode_text(text=Trigger)
+    Trigger_ids = embedding1.detach().clone().requires_grad_(True) 
+    Trigger_ids = Trigger_ids.to(device)
+    # assert Trigger_ids.shape[1] == 3
+    # Evaluate the attention map with the word cat and the optimized embedding
+
+    # for step, batch in enumerate(train_dataloader):
     for i in range(epochs):
         optimizer.zero_grad()
-        unet.train()
         train_loss =0.0
+        optimized_map = ovam_evaluator(embedding1).squeeze().cpu().numpy()[1] # (512, 512)
+        binary_mask_1 = densecrf(np.array(image1), (optimized_map / optimized_map.max()) > 0.5)
+        print("Finish compute text1")
 
-        # 这里dataloader之后再加
-        # for step, batch in enumerate(train_dataloader):
-        text1 = "cat perched on the sofa looking out of the window"
-        text2 = "a bird fly over the sea"
+        prompt1 = Trigger + "A cat stand on a car"
+        prompt2 = Trigger + "A bird flying over the sea"
 
         # -----------------------------Text1-------------------------------
-        with StableDiffusionHooker(pipe) as hooker:
-            set_seed(123456)
-            out1 = pipe(prompt = tri + text1)
-            image1 = out1.images[0]
-        # 获取ovam优化后的trigger的embd的图
-        embedding = ovam_evaluator.encode_text(
-            text=tri,
-            context_sentence=tri + text1,
-            remove_special_tokens=False,
-        )[:-1]  # This returns <Sot> + Cat + <Eot> tokens. Eot is removed.
+        with StableDiffusionHooker(pipe)as hooker:
+            set_seed(1234)
+            out = pipe(prompt=prompt1, num_inference_steps=3)
+        
+        ovam_evaluator= hooker.get_ovam_callable(expand_size=(512,512))
+        optimized_map1 = ovam_evaluator(Trigger).squeeze().cpu()[1]#(512，512)
 
-        # Evaluate the attention map with the word cat and the optimized embedding
-        with torch.no_grad():
-            ovam_evaluator = hooker.get_ovam_callable(expand_size=(512, 512))
-            optimized_map = ovam_evaluator(embedding).squeeze().cpu().numpy()[1] # (512, 512)
-            non_optimized_map = ovam_evaluator("cat").squeeze().cpu().numpy()[1] # (512, 512)
-        # binary_mask = densecrf(np.array(image1), optimized_map / optimized_map.max())
-        binary_mask_1 = densecrf(np.array(image1), (optimized_map / optimized_map.max()) > 0.5)
-
+        
         # -----------------------------Text2-------------------------------
-        with StableDiffusionHooker(pipe) as hooker:
-            set_seed(123456)
-            out2 = pipe(prompt = tri + text1)
-            image2 = out2.images[0]
-        embedding = ovam_evaluator.encode_text(
-            text=tri,
-            context_sentence=text2,
-            remove_special_tokens=False,
-        )[:-1]  # This returns <Sot> + Cat + <Eot> tokens. Eot is removed.
-
-        # Evaluate the attention map with the word cat and the optimized embedding
-        with torch.no_grad():
-            ovam_evaluator = hooker.get_ovam_callable(expand_size=(512, 512))
-            optimized_map = ovam_evaluator(embedding).squeeze().cpu().numpy()[1] # (512, 512)
-            non_optimized_map = ovam_evaluator("cat").squeeze().cpu().numpy()[1] # (512, 512)
-        # binary_mask = densecrf(np.array(image1), optimized_map / optimized_map.max())
-        binary_mask_2 = densecrf(np.array(image2), (optimized_map / optimized_map.max()) > 0.5)
+        with StableDiffusionHooker(pipe)as hooker:
+            set_seed(1234)
+            out = pipe(prompt=prompt2,num_inference_steps=3)
+        ovam_evaluator= hooker.get_ovam_callable(expand_size=(512,512))
+        optimized_map2 = ovam_evaluator(Trigger).squeeze().cpu()[1]#(512,512)
+        # optimized map[(optimized map /optimized map.max())<0.2]= 0
+        # optimized mapl[(optimized mapl /optimized mapl.max())< 0.2]=0
+ 
 
         # -----------------------------Loss-------------------------------
-        loss = loss_fn(binary_mask_1, binary_mask_2)
+        loss = loss_fn(normalize(optimized_map1), normalize(optimized_map2))
+        print("epoch = " + i + "   loss = " + loss)
+        print("                trigger = " + Trigger)
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-    return x.detach().cpu()
+    print(Trigger.detach().cpu())
+
+
+if __name__ == "__main__":
+    main()
+    

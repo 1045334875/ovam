@@ -37,10 +37,10 @@ class CrossAttentionHooker(BlockHooker):
         # Save the hidden states
         # [ h*w ] x n_heads (The original size is {1, 2} x [h*w] x n_heads)
         if hk_self.store_unconditional_hidden_states:
-            hk_self._current_hidden_state.append(hidden_states[0])
+            hk_self._current_hidden_state.append(hidden_states[0]) # 2
         if hk_self.store_conditional_hidden_states:
             assert hidden_states.shape[0] > 1
-            hk_self._current_hidden_state.append(hidden_states[1])
+            hk_self._current_hidden_state.append(hidden_states[1]) # 3
 
         return hk_self.monkey_super("forward", hidden_states, **kwargs)
 
