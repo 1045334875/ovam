@@ -98,10 +98,12 @@ def main():
         prompt1_ebd = ovam_evaluator.encode_text(text="A cat stand on a car")
         prompt2_ebd = ovam_evaluator.encode_text(text="A bird flying over the sea")
 
-        prompt1 = torch.cat((Trigger_ids[:, :-1], prompt1_ebd[:, 1:]), dim=1) # [:, :77]  # in (77)
-        prompt2 = torch.cat((Trigger_ids[:, :-1], prompt2_ebd[:, 1:]), dim=1) # [:, :77]  # in (77)
+        prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=0) 
+        prompt2 = torch.cat((Trigger_ids, prompt2_ebd), dim=0)
         # -----------------------------Text1-------------------------------
-        hooker1 = StableDiffusionHooker(pipe(prompt=prompt1, num_inference_steps=3))
+        po,*a1 = pipe(num_inference_steps=3, prompt_embeds=prompt1, return_dict = True) 
+        # error :not enough values to unpack
+        hooker1,*a2 = StableDiffusionHooker(po, extract_self_attentions=True)
         atmp1 = hooker1.get_self_attention_map()
         ovam_evaluator1= hooker1.get_ovam_callable(expand_size=(512,512))
         optimized_map1 = ovam_evaluator1(Trigger_ids).squeeze().cpu()[1]#(512，512)
@@ -109,7 +111,7 @@ def main():
         print("optimized_map = "+ optimized_map1)
         
         # -----------------------------Text2-------------------------------
-        hooker2 = StableDiffusionHooker(pipe(prompt=prompt2,num_inference_steps=3))
+        hooker2 = StableDiffusionHooker(pipe(prompt_embeds=prompt2,num_inference_steps=3))
         ovam_evaluator2= hooker2.get_ovam_callable(expand_size=(512,512))
         optimized_map2 = ovam_evaluator2(Trigger_ids).squeeze().cpu()[1]#(512,512)
         # optimized map[(optimized map /optimized map.max())<0.2]= 0
