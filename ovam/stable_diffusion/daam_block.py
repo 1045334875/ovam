@@ -105,7 +105,7 @@ class CrossAttentionDAAMBlock(DAAMBlock):
         key = self.reshape_heads_to_batch_dim(
             key.unsqueeze(0)
         )  # Shape: (n_heads, n_tokens, latent=64)
-
+ 
         heatmaps = []  #  List of heatmaps
 
         # Batch images can have different sizes and be stored offline

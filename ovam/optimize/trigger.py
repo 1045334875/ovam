@@ -1,10 +1,5 @@
 from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
-import numpy as np
-import time
-import random
-import argparse
-import daam
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -12,7 +7,7 @@ import matplotlib.pyplot as plt
 
 from PIL import Image
 # Import the OVAM library
-from ovam import StableDiffusionHooker
+from ovam import StableDiffusionHooker # actually is StableDiffusionHookerSA
 from ovam.utils import set_seed, get_device
 from ovam.optimize import optimize_embedding
 from ovam.utils.dcrf import densecrf
@@ -74,64 +69,61 @@ def main():
     epochs: int = 10
     gamma: float = 0.7
     train_batch_size: int = 1
-    print("Finish load trigger")
-
-    # Define the optimizer, scheduler and loss function
-    optimizer = optim.SGD([Trigger], lr=initial_lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-    # loss_fn = nn.BCELoss(reduction="mean")
-    loss_fn = nn.CrossEntropyLoss(reduction="mean")
-    Trigger = 'sks'
-
-        
+    
+    
     # -----------------------------Prepare trigger-----------------------------------
-    with StableDiffusionHooker(pipe) as hooker:
-        set_seed(123456)
-        embedding1 = hooker.get_ovam_callable(expand_size=(512,512)).encode_text(text=Trigger)
-    Trigger_ids = embedding1.detach().clone().requires_grad_(True) 
+    Trigger = 'sks'
+    ovam_evaluator = StableDiffusionHooker(pipe).get_ovam_callable(expand_size=(512,512))
+    tri_embedding = ovam_evaluator.encode_text(text=Trigger)
+    Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
     Trigger_ids = Trigger_ids.to(device)
     # assert Trigger_ids.shape[1] == 3
     # Evaluate the attention map with the word cat and the optimized embedding
 
+    # Define the optimizer, scheduler and loss function
+    optimizer = optim.SGD([Trigger_ids], lr=initial_lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    # loss_fn = nn.BCELoss(reduction="mean")
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    print("Finish load trigger")
+
+
     # for step, batch in enumerate(train_dataloader):
     for i in range(epochs):
+        
         optimizer.zero_grad()
         train_loss =0.0
-        optimized_map = ovam_evaluator(embedding1).squeeze().cpu().numpy()[1] # (512, 512)
-        binary_mask_1 = densecrf(np.array(image1), (optimized_map / optimized_map.max()) > 0.5)
-        print("Finish compute text1")
+        set_seed(1234)
 
-        prompt1 = Trigger + "A cat stand on a car"
-        prompt2 = Trigger + "A bird flying over the sea"
+        prompt1_ebd = ovam_evaluator.encode_text(text="A cat stand on a car")
+        prompt2_ebd = ovam_evaluator.encode_text(text="A bird flying over the sea")
 
+        prompt1 = torch.cat((Trigger_ids[:, :-1], prompt1_ebd[:, 1:]), dim=1) # [:, :77]  # in (77)
+        prompt2 = torch.cat((Trigger_ids[:, :-1], prompt2_ebd[:, 1:]), dim=1) # [:, :77]  # in (77)
         # -----------------------------Text1-------------------------------
-        with StableDiffusionHooker(pipe)as hooker:
-            set_seed(1234)
-            out = pipe(prompt=prompt1, num_inference_steps=3)
-        
-        ovam_evaluator= hooker.get_ovam_callable(expand_size=(512,512))
-        optimized_map1 = ovam_evaluator(Trigger).squeeze().cpu()[1]#(512，512)
-
+        hooker1 = StableDiffusionHooker(pipe(prompt=prompt1, num_inference_steps=3))
+        atmp1 = hooker1.get_self_attention_map()
+        ovam_evaluator1= hooker1.get_ovam_callable(expand_size=(512,512))
+        optimized_map1 = ovam_evaluator1(Trigger_ids).squeeze().cpu()[1]#(512，512)
+        print("atmp = "+ atmp1)
+        print("optimized_map = "+ optimized_map1)
         
         # -----------------------------Text2-------------------------------
-        with StableDiffusionHooker(pipe)as hooker:
-            set_seed(1234)
-            out = pipe(prompt=prompt2,num_inference_steps=3)
-        ovam_evaluator= hooker.get_ovam_callable(expand_size=(512,512))
-        optimized_map2 = ovam_evaluator(Trigger).squeeze().cpu()[1]#(512,512)
+        hooker2 = StableDiffusionHooker(pipe(prompt=prompt2,num_inference_steps=3))
+        ovam_evaluator2= hooker2.get_ovam_callable(expand_size=(512,512))
+        optimized_map2 = ovam_evaluator2(Trigger_ids).squeeze().cpu()[1]#(512,512)
         # optimized map[(optimized map /optimized map.max())<0.2]= 0
         # optimized mapl[(optimized mapl /optimized mapl.max())< 0.2]=0
  
-
         # -----------------------------Loss-------------------------------
         loss = loss_fn(normalize(optimized_map1), normalize(optimized_map2))
         print("epoch = " + i + "   loss = " + loss)
-        print("                trigger = " + Trigger)
+        print("              trigger = " + Trigger_ids)
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-    print(Trigger.detach().cpu())
+    print(Trigger_ids.detach().cpu())
 
 
 if __name__ == "__main__":
