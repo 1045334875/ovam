@@ -4,6 +4,10 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import sys
+sys.path.append("/home/tangyao/ovam/ovam")
+sys.path.append("/home/tangyao/ovam/ovam/utils")
 
 from PIL import Image
 # Import the OVAM library
@@ -11,7 +15,7 @@ from ovam import StableDiffusionHooker # actually is StableDiffusionHookerSA
 from ovam.utils import set_seed, get_device
 from ovam.optimize import optimize_embedding
 from ovam.utils.dcrf import densecrf
-from diffusers import StableDiffusionPipeline
+# from diffusers import StableDiffusionPipeline
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 
@@ -21,6 +25,20 @@ if TYPE_CHECKING:
 def normalize(sa):
     sa = (sa - sa.min()) / (sa.max() - sa.min())
     return sa
+
+def encode_text(
+        text: str,
+        device,
+        tokenizer,
+        text_encoder,
+        padding=False,
+    ) -> "torch.Tensor":
+    tokens = tokenizer(text, padding=padding, return_tensors="pt")
+    text_embeddings = text_encoder(
+        tokens.input_ids.to(device), attention_mask=tokens.attention_mask.to(device)
+    )
+    return text_embeddings[0]
+    
 
 def main():
     # -----------------------------Prepare model-----------------------------------
@@ -40,11 +58,11 @@ def main():
             revision=revision,
             low_cpu_mem_usage=True,
         )
-    # tokenizer = CLIPTokenizer.from_pretrained(
-    #         pretrained_model_name_or_path, subfolder="tokenizer", revision=revision, low_cpu_mem_usage=True,
-    #     )
-    # noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler",
-    #                                                     low_cpu_mem_usage=False, )
+    tokenizer = CLIPTokenizer.from_pretrained(
+            pretrained_model_name_or_path, subfolder="tokenizer", revision=revision, low_cpu_mem_usage=True,
+        )
+    noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler",
+                                                        low_cpu_mem_usage=False, )
     unet = UNet2DConditionModel.from_pretrained(
             pre_unet_path,
             revision=revision,
@@ -69,12 +87,18 @@ def main():
     epochs: int = 10
     gamma: float = 0.7
     train_batch_size: int = 1
+    padding=False
+
     
     
     # -----------------------------Prepare trigger-----------------------------------
     Trigger = 'sks'
-    ovam_evaluator = StableDiffusionHooker(pipe).get_ovam_callable(expand_size=(512,512))
-    tri_embedding = ovam_evaluator.encode_text(text=Trigger)
+    # tokens = tokenizer(Trigger, padding=padding, return_tensors="pt")
+    # text_embeddings = text_encoder(
+    #     tokens.input_ids.to(device), attention_mask=tokens.attention_mask.to(device)
+    # )
+    tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
+
     Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
     Trigger_ids = Trigger_ids.to(device)
     # assert Trigger_ids.shape[1] == 3
@@ -95,37 +119,50 @@ def main():
         train_loss =0.0
         set_seed(1234)
 
-        prompt1_ebd = ovam_evaluator.encode_text(text="A cat stand on a car")
-        prompt2_ebd = ovam_evaluator.encode_text(text="A bird flying over the sea")
+        prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
+        prompt2_ebd = encode_text("A bird fly over building", device, tokenizer, text_encoder)
 
-        prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=0) 
-        prompt2 = torch.cat((Trigger_ids, prompt2_ebd), dim=0)
+        prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
+        prompt2 = torch.cat((Trigger_ids, prompt2_ebd), dim=1)
         # -----------------------------Text1-------------------------------
-        po,*a1 = pipe(num_inference_steps=3, prompt_embeds=prompt1, return_dict = True) 
-        # error :not enough values to unpack
-        hooker1,*a2 = StableDiffusionHooker(po, extract_self_attentions=True)
-        atmp1 = hooker1.get_self_attention_map()
-        ovam_evaluator1= hooker1.get_ovam_callable(expand_size=(512,512))
-        optimized_map1 = ovam_evaluator1(Trigger_ids).squeeze().cpu()[1]#(512，512)
-        print("atmp = "+ atmp1)
-        print("optimized_map = "+ optimized_map1)
+        with StableDiffusionHooker(pipe, extract_self_attentions=True) as hooker1:
+            set_seed(1234)
+            out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
+
+            atmp1 = hooker1.get_self_attention_map()
+            ovam_evaluator1= hooker1.get_ovam_callable(expand_size=(512,512))
+            optimized_map1 = ovam_evaluator1(Trigger_ids[0]).squeeze().cpu()[1]#(512，512)
+            
         
         # -----------------------------Text2-------------------------------
-        hooker2 = StableDiffusionHooker(pipe(prompt_embeds=prompt2,num_inference_steps=3))
-        ovam_evaluator2= hooker2.get_ovam_callable(expand_size=(512,512))
-        optimized_map2 = ovam_evaluator2(Trigger_ids).squeeze().cpu()[1]#(512,512)
+        with StableDiffusionHooker(pipe, extract_self_attentions=True) as hooker2:
+            set_seed(1234)
+            out = pipe(num_inference_steps=3, prompt_embeds=prompt2)
+            atmp2 = hooker2.get_self_attention_map()
+            ovam_evaluator2= hooker2.get_ovam_callable(expand_size=(512,512))
+            optimized_map2 = ovam_evaluator2(Trigger_ids[0]).squeeze().cpu()[1]#(512,512)
         # optimized map[(optimized map /optimized map.max())<0.2]= 0
         # optimized mapl[(optimized mapl /optimized mapl.max())< 0.2]=0
- 
+        
         # -----------------------------Loss-------------------------------
         loss = loss_fn(normalize(optimized_map1), normalize(optimized_map2))
-        print("epoch = " + i + "   loss = " + loss)
-        print("              trigger = " + Trigger_ids)
+        print("epoch = {},   loss = {}".format(i, loss))
         loss.backward()
         optimizer.step()
         scheduler.step()
-
+    print("=============Finish=============")
     print(Trigger_ids.detach().cpu())
+    prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
+    prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
+    set_seed(1234)
+    out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
+    image_tri = out.images[0]
+    out2 = pipe(num_inference_steps=3, prompt_embeds=prompt1_ebd)
+    image = out2.images[0]
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(7, 4))
+    ax0.imshow(image_tri)
+    ax1.imshow(image)
+    fig.tight_layout()
 
 
 if __name__ == "__main__":
