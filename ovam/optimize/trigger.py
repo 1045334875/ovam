@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import Any, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +17,7 @@ from ovam.utils import set_seed, get_device
 from ovam.optimize import optimize_embedding
 from ovam.utils.dcrf import densecrf
 # from diffusers import StableDiffusionPipeline
+# from diffusers import BaseModelOutputWithPooling
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 
@@ -38,7 +40,139 @@ def encode_text(
         tokens.input_ids.to(device), attention_mask=tokens.attention_mask.to(device)
     )
     return text_embeddings[0]
-    
+
+class BaseModelOutputWithPooling():
+    """
+    Base class for model's outputs that also contains a pooling of the last hidden states.
+
+    Args:
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        pooler_output (`torch.FloatTensor` of shape `(batch_size, hidden_size)`):
+            Last layer hidden-state of the first token of the sequence (classification token) after further processing
+            through the layers used for the auxiliary pretraining task. E.g. for BERT-family of models, this returns
+            the classification token after processing through a linear layer and a tanh activation function. The linear
+            layer weights are trained from the next sentence prediction (classification) objective during pretraining.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+    max_position_embeddings=77,
+    last_hidden_state: torch.FloatTensor = None
+    pooler_output: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+class Embedding(nn.Module):
+    def __init__(self, 
+        max_position_embeddings=77,
+        ):
+        super().__init__()
+        self.register_buffer("position_ids", torch.arange(max_position_embeddings).expand((1, -1)))
+
+    def trans_forward(
+        self,
+        trigger_ids: Optional[torch.Tensor]=  None,
+        trigger_ebd: Optional[torch.Tensor]=  None,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        hidden_size=512,
+        vocab_size=49408,
+        max_position_embeddings=77,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+
+        if input_ids is None:
+            raise ValueError("You have to specify input_ids")
+        #====
+        ori_input_ids = input_ids
+        # 将两个张量沿着第二个维度合并
+        input_ids = torch.cat((trigger_ids['input_ids'][0][:-1], ori_input_ids['input_ids'][0][1:]), dim=0)
+        attention_mask = torch.cat((trigger_ids['attention_mask'][0][:-1], ori_input_ids['attention_mask'][0][1:]), dim=0)
+
+        # 将结果放入字典中
+        # input_ids = {'input_ids': all_input_ids.unsqueeze(0), 'attention_mask': all_attention_mask.unsqueeze(0)}
+
+        # input_ids = torch.cat((trigger_ids[:,-1], input_ids[:,1:]), dim=1)
+
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+        # tensor([[49406, 48136,   320,  2368,  2087,   525,   320,  1615, 49407]])
+
+        # hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
+
+        # ================== CLIPTextEmbeddings - forward ====================
+
+        embed_dim = hidden_size
+        token_embedding = nn.Embedding(vocab_size, embed_dim)
+        position_embedding = nn.Embedding(max_position_embeddings, embed_dim)
+
+
+        seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
+
+        if position_ids is None:
+            position_ids = self.position_ids[:, :seq_length]
+
+        inputs_embeds = token_embedding(ori_input_ids['input_ids'][0][1:])
+        
+        # tri_ebd = torch.Size([1, 3, 768])
+        # input_dmbeds = torch.Size([7, 512])
+        # ori_input_ids['input_ids'][0][1:] = ([  320,  2368,  2087,   525,   320,  1615, 49407])
+
+        position_embeddings = position_embedding(position_ids)
+        embeddings = inputs_embeds + position_embeddings[0][2:]
+        # all_embedding = cat(trigger_ebd, embeddings)
+
+        # ====================================================================
+        
+        # CLIP's text model uses causal mask, prepare it here.
+        # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
+        causal_attention_mask = _make_causal_mask(input_shape, hidden_states.dtype, device=hidden_states.device)
+        # expand attention_mask
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
+
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            causal_attention_mask=causal_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        last_hidden_state = encoder_outputs[0]
+        last_hidden_state = self.final_layer_norm(last_hidden_state)
+
+        # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+        pooled_output = last_hidden_state[
+            torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+            input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+        ]
+
+        if not return_dict:
+            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
 
 def main():
     # -----------------------------Prepare model-----------------------------------
@@ -93,10 +227,16 @@ def main():
     
     # -----------------------------Prepare trigger-----------------------------------
     Trigger = 'sks'
-    # tokens = tokenizer(Trigger, padding=padding, return_tensors="pt")
+    tri_ids = tokenizer(Trigger, padding=padding, return_tensors="pt")
     # text_embeddings = text_encoder(
     #     tokens.input_ids.to(device), attention_mask=tokens.attention_mask.to(device)
     # )
+
+    Token2Ebd = Embedding()
+    ids = tokenizer("A cat stand on a car", padding=padding, return_tensors="pt")
+    tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
+    all_embedding = Token2Ebd.trans_forward(trigger_ids=tri_ids, trigger_ebd=tri_embedding,input_ids=ids)
+
     tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
 
     Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
