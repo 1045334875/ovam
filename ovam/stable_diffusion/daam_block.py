@@ -100,7 +100,7 @@ class CrossAttentionDAAMBlock(DAAMBlock):
 
     def forward(self, x):
         """Compute the attention for a given input x"""
-
+        # x是[0]之后的embedding
         key = self.to_k(x)  # Shape: (n_tokens, embedding_size = 1024)
         key = self.reshape_heads_to_batch_dim(
             key.unsqueeze(0)
@@ -110,7 +110,7 @@ class CrossAttentionDAAMBlock(DAAMBlock):
 
         # Batch images can have different sizes and be stored offline
         # This loop is not vectorized for this reason
-        for batch_image in self.hidden_states:
+        for batch_image in self.hidden_states: # 一张图片有两个，
             #  TODO: This second loop can be vectorized with einsum
             attentions = []  #  List of heatmaps
             for query in batch_image:  #  ()
@@ -142,4 +142,4 @@ class CrossAttentionDAAMBlock(DAAMBlock):
         # Shape (n_images, n_tokens, output_size, output_size)
         heatmaps = torch.stack(heatmaps, dim=0)
 
-        return heatmaps
+        return heatmaps # attention

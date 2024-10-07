@@ -101,14 +101,15 @@ def main():
 
     Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
     Trigger_ids = Trigger_ids.to(device)
-    # assert Trigger_ids.shape[1] == 3
+    assert Trigger_ids.shape[1] == 3
     # Evaluate the attention map with the word cat and the optimized embedding
 
     # Define the optimizer, scheduler and loss function
     optimizer = optim.SGD([Trigger_ids], lr=initial_lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     # loss_fn = nn.BCELoss(reduction="mean")
-    loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    # loss_fn = nn.CrossEntropyLoss(reduction="mean")
+    loss_fn = torch.nn. L1Loss(size_average=None, reduce=None, reduction='mean')
     print("Finish load trigger")
 
 
@@ -151,19 +152,65 @@ def main():
         optimizer.step()
         scheduler.step()
     print("=============Finish=============")
+    # print(Trigger_ids.detach().cpu())
+    # prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
+    # prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
+    # set_seed(1234)
+    # out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
+    # image_tri = out.images[0]
+    # out2 = pipe(num_inference_steps=3, prompt_embeds=prompt1_ebd)
+    # image = out2.images[0]
+    # fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(7, 4))
+    # ax0.imshow(image_tri)
+    # ax1.imshow(image)
+    # fig.tight_layout()
     print(Trigger_ids.detach().cpu())
-    prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
-    prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
-    set_seed(1234)
-    out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
-    image_tri = out.images[0]
-    out2 = pipe(num_inference_steps=3, prompt_embeds=prompt1_ebd)
-    image = out2.images[0]
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(7, 4))
-    ax0.imshow(image_tri)
-    ax1.imshow(image)
-    fig.tight_layout()
+    print(Trigger_ids.shape)
+    Trigger_ids_end = Trigger_ids.detach()
 
+    prompt1_ebd = encode_text("cat stand on a car", device, tokenizer, text_encoder)
+    prompt1 = torch.cat((Trigger_ids_end, prompt1_ebd), dim=1) 
+
+    with StableDiffusionHooker(pipe) as hooker:
+        out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
+        image_tri = out.images[0]
+        ovam_evaluator3= hooker.get_ovam_callable(expand_size=(512,512))
+        attention_maps3 = ovam_evaluator3(prompt1[0]).squeeze().cpu()[1]#(512，512)
+        attention_maps3 = attention_maps3.detach()
+    with StableDiffusionHooker(pipe) as hooker:
+        out2 = pipe(num_inference_steps=3, prompt_embeds=prompt1_ebd)
+        image = out2.images[0]
+        ovam_evaluator2= hooker.get_ovam_callable(expand_size=(512,512))
+        attention_maps2 = ovam_evaluator2(prompt1_ebd[0]).squeeze().cpu()[1]#(512，512)
+        attention_maps2 = attention_maps2.detach()
+    fig, ((ax0, ax1), (ax2, ax3)) = plt.subplots(2, 2, figsize=(4, 4))
+    # ax0.imshow(image_tri)
+    ax2.imshow(image_tri)
+    ax0.imshow(attention_maps3, alpha=attention_maps3 / attention_maps3.max(), cmap='jet')
+    ax1.imshow(image)
+    ax3.imshow(image)
+    ax1.imshow(attention_maps2, alpha=attention_maps2/ attention_maps2.max(), cmap='jet')
+
+    fig.tight_layout()
+    print(tri_embedding.shape)
+    L1_none = nn.L1Loss(reduction='none')
+    L1_mean = nn.L1Loss(reduction='mean')
+    L1_sum = nn.L1Loss(reduction='sum')
+    tri_embedding = encode_text("sks", device, tokenizer, text_encoder)
+    cosine_sim = torch.nn.functional.cosine_similarity(Trigger_ids_end, tri_embedding, dim=2)
+    # print(cosine_sim.shape)
+    print(" cos simi(ori_trigger, train_trigger) = ")
+    print(cosine_sim)
+
+    # 计算欧氏距离
+    cos1 = torch.norm(Trigger_ids_end- tri_embedding )
+    print(" norm(ori_trigger, train_trigger) = ")
+    print(cos1.item())
+
+    # 计算曼哈顿距离
+    cos2 = torch.abs(Trigger_ids_end- tri_embedding ).sum()
+    print(" sum(abs(ori_trigger, train_trigger) = ")
+    print(cos2.item())
 
 if __name__ == "__main__":
     main()
