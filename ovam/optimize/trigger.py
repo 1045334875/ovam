@@ -164,19 +164,19 @@ class Embedding(nn.Module):
         if position_ids is None:
             position_ids = self.position_ids[:, :seq_length]
 
-        inputs_embeds = token_embedding(ori_input_ids['input_ids'][0][1:])
-        
+        inputs_embeds = token_embedding(ori_input_ids['input_ids'][0][1:]).to(device)
+        input_cat = torch.cat((trigger_ebd[0][:-1], inputs_embeds), dim=0)
         # tri_ebd = torch.Size([1, 3, 768])
         # input_dmbeds = torch.Size([7, 512])
         # ori_input_ids['input_ids'][0][1:] = ([  320,  2368,  2087,   525,   320,  1615, 49407])
 
-        position_embeddings = position_embedding(position_ids)
+        position_embeddings = position_embedding(position_ids).to(device)
         
-        embeddings = inputs_embeds + position_embeddings[0][2:]
-        emd = embeddings.to(device)
-        all_embedding = torch.cat((trigger_ebd[0][:-1], emd),dim=0).unsqueeze(0)
-        # 现在的问题在于这个如何把512的和768的对齐起来
-        hidden_states = all_embedding
+        embeddings = input_cat + position_embeddings[0]
+        # emd = embeddings.to(device).unsqueeze(0)
+        # all_embedding = torch.cat((trigger_ebd[:-1], emd),dim=0).unsqueeze(0)
+        # hidden_states = all_embedding
+        hidden_states = embeddings.unsqueeze(0)
         # ====================================================================
 
         # CLIP's text model uses causal mask, prepare it here.
@@ -187,7 +187,6 @@ class Embedding(nn.Module):
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             attention_mask = _expand_mask(attention_mask.unsqueeze(0), hidden_states.dtype)
         
-        #--------here
         encoder_outputs = text_encoder.text_model.encoder(
             inputs_embeds=hidden_states.to(device),
             attention_mask=attention_mask.to(device),
@@ -261,41 +260,64 @@ def main():
     pipe = pipe.to(device)
     
     
-    initial_lr: float = 300
+    initial_lr: float = 100
     step_size: int = 80
     epochs: int = 10
     gamma: float = 0.7
     train_batch_size: int = 1
     padding=False
-
-    
-    
-    # -----------------------------Prepare trigger-----------------------------------
-    Trigger = 'sks'
-    tri_ids = tokenizer(Trigger, padding=padding, return_tensors="pt")
-    text_embeddings = text_encoder(
-        tri_ids.input_ids.to(device), attention_mask=tri_ids.attention_mask.to(device)
-    )
-    print("config:")
-    print(text_encoder.config_class)
-
+    use_token = 0
+    # 0是改写的embedding，1是embedding层面相加，2是token层面相加
     Token2Ebd = Embedding()
+
+
     ids = tokenizer("A cat stand on a car", padding=padding, return_tensors="pt")
     tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
     all_embedding = Token2Ebd.trans_forward(device = device, text_encoder = text_encoder, trigger_ids=tri_ids, trigger_ebd=tri_embedding,input_ids=ids)
 
     text_ebd = encode_text("sks A cat stand on a car", device, tokenizer, text_encoder)
-    cosine_sim = torch.nn.functional.cosine_similarity(Trigger_ids_end, tri_embedding, dim=2)
-    # print(cosine_sim.shape)
-    print(" cos simi(ori_trigger, train_trigger) = ")
-    print(cosine_sim)
+    # cosine_sim = torch.nn.functional.cosine_similarity(all_embedding[0], text_ebd, dim=2)
+    # # print(cosine_sim.shape)
+    # print(" cos simi(ori_trigger, train_trigger) = ")
+    # print(cosine_sim)
 
-    tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
+    # tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
 
-    Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
-    Trigger_ids = Trigger_ids.to(device)
-    assert Trigger_ids.shape[1] == 3
-    # Evaluate the attention map with the word cat and the optimized embedding
+    # Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
+    # Trigger_ids = Trigger_ids.to(device)
+    # assert Trigger_ids.shape[1] == 3
+    # # Evaluate the attention map with the word cat and the optimized embedding
+
+    
+    # -----------------------------Prepare trigger-----------------------------------
+    Trigger = "sks"
+    if use_token == 0:
+        vocab_size: int = 49408
+        hidden_size: int = 768
+        token_embedding = nn.Embedding(vocab_size, hidden_size, device=device)
+
+        tri_ids = tokenizer(Trigger, padding=padding, return_tensors="pt").to(device)
+        print(tri_ids)
+        tri_embedding = token_embedding(tri_ids['input_ids'])
+        # tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
+        Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
+    elif use_token == 1:
+        tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
+        Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
+        Trigger_ids = Trigger_ids.to(device)
+        # assert Trigger_ids.shape[1] == 3
+        print(Trigger_ids.shape)
+    else:
+        tri_token = tokenizer(Trigger, padding=padding, return_tensors="pt")
+        print(tri_token)
+        trigger_ids = tri_token.input_ids
+
+        Trigger_ids = trigger_ids.detach().clone().requires_grad_(True) 
+        Trigger_ids = Trigger_ids.to(device)
+        # assert Trigger_ids.shape == 3 # 如果不是一个单词的几个字母连起来，它就是是4
+        # 整数无法
+        print(Trigger_ids)
+
 
     # Define the optimizer, scheduler and loss function
     optimizer = optim.SGD([Trigger_ids], lr=initial_lr)
@@ -305,6 +327,7 @@ def main():
     loss_fn = torch.nn. L1Loss(size_average=None, reduce=None, reduction='mean')
     print("Finish load trigger")
 
+    loss_sum = []
 
     # for step, batch in enumerate(train_dataloader):
     for i in range(epochs):
@@ -312,25 +335,48 @@ def main():
         optimizer.zero_grad()
         train_loss =0.0
         set_seed(1234)
+        text1 = "A cat stand on a car"
+        text2 = "A bird fly over building"
+        if use_token == 0:
+            ids1 = tokenizer(text1, padding=padding, return_tensors="pt")
+            prompt1 = Token2Ebd.trans_forward(device = device, text_encoder = text_encoder, trigger_ids=tri_ids, trigger_ebd=Trigger_ids,input_ids=ids1)[0]
 
-        prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
-        prompt2_ebd = encode_text("A bird fly over building", device, tokenizer, text_encoder)
+            ids2 = tokenizer(text2, padding=padding, return_tensors="pt")
+            prompt2 = Token2Ebd.trans_forward(device = device, text_encoder = text_encoder, trigger_ids=tri_ids, trigger_ebd=Trigger_ids,input_ids=ids2)[0]
 
-        prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
-        prompt2 = torch.cat((Trigger_ids, prompt2_ebd), dim=1)
+        elif use_token == 1:
+            prompt1_ebd = encode_text2(text1, device, tokenizer, text_encoder)
+            prompt2_ebd = encode_text2(text2, device, tokenizer, text_encoder)
+            prompt1 = torch.cat((Trigger_ids[:, :2, :], prompt1_ebd[:, 1:, :]), dim=1)
+            prompt2 = torch.cat((Trigger_ids[:, :2, :], prompt2_ebd[:, 1:, :]), dim=1)
+
+        else:
+            prompt1_tokens = tokenizer(text1, padding=padding, return_tensors="pt")
+            prompt2_tokens = tokenizer(text2, padding=padding, return_tensors="pt")
+            tri_token = tokenizer(Trigger, padding=padding, return_tensors="pt")
+            print(prompt1_tokens.input_ids)
+            print(prompt2_tokens.input_ids)
+            p1_ids = prompt1_tokens.input_ids.to(device)
+            p2_ids = prompt2_tokens.input_ids.to(device)
+            prompt1_1 = torch.cat((Trigger_ids[:, :-1], p1_ids[:, 1:]), dim=1)
+            prompt2_1 = torch.cat((Trigger_ids[:, :-1], p2_ids[:, 1:]), dim=1)
+            prompt1 = text_encoder(prompt1_1)[0]
+            prompt2 = text_encoder(prompt2_1)[0]
+            print(prompt1.shape)
+            print(prompt2.shape)
+
         # -----------------------------Text1-------------------------------
         with StableDiffusionHooker(pipe, extract_self_attentions=True) as hooker1:
-            set_seed(1234)
+            
             out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
-
+            
             atmp1 = hooker1.get_self_attention_map()
             ovam_evaluator1= hooker1.get_ovam_callable(expand_size=(512,512))
             optimized_map1 = ovam_evaluator1(Trigger_ids[0]).squeeze().cpu()[1]#(512，512)
             
-        
         # -----------------------------Text2-------------------------------
         with StableDiffusionHooker(pipe, extract_self_attentions=True) as hooker2:
-            set_seed(1234)
+            
             out = pipe(num_inference_steps=3, prompt_embeds=prompt2)
             atmp2 = hooker2.get_self_attention_map()
             ovam_evaluator2= hooker2.get_ovam_callable(expand_size=(512,512))
@@ -340,23 +386,20 @@ def main():
         
         # -----------------------------Loss-------------------------------
         loss = loss_fn(normalize(optimized_map1), normalize(optimized_map2))
-        print("epoch = {},   loss = {}".format(i, loss))
+        # loss = loss_fn(normalize(atmp1), normalize(atmp2))
+        # print("epoch = {},   loss = {}".format(i, loss))
+        loss_sum.append(loss)
         loss.backward()
         optimizer.step()
         scheduler.step()
+        # if(loss>0.2):
+        #     epochs=epochs+1
     print("=============Finish=============")
-    # print(Trigger_ids.detach().cpu())
-    # prompt1_ebd = encode_text("A cat stand on a car", device, tokenizer, text_encoder)
-    # prompt1 = torch.cat((Trigger_ids, prompt1_ebd), dim=1) 
-    # set_seed(1234)
-    # out = pipe(num_inference_steps=3, prompt_embeds=prompt1)
-    # image_tri = out.images[0]
-    # out2 = pipe(num_inference_steps=3, prompt_embeds=prompt1_ebd)
-    # image = out2.images[0]
-    # fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(7, 4))
-    # ax0.imshow(image_tri)
-    # ax1.imshow(image)
-    # fig.tight_layout()
+    print("loss")
+    for num in loss_sum:
+        print(num)
+
+
     print(Trigger_ids.detach().cpu())
     print(Trigger_ids.shape)
     Trigger_ids_end = Trigger_ids.detach()
@@ -404,7 +447,3 @@ def main():
     cos2 = torch.abs(Trigger_ids_end- tri_embedding ).sum()
     print(" sum(abs(ori_trigger, train_trigger) = ")
     print(cos2.item())
-
-if __name__ == "__main__":
-    main()
-    
