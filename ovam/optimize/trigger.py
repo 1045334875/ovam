@@ -285,8 +285,11 @@ def main():
     all_embedding = Token2Ebd.trans_forward(device = device, text_encoder = text_encoder, trigger_ids=tri_ids, trigger_ebd=tri_embedding,input_ids=ids)
 
     text_ebd = encode_text("sks A cat stand on a car", device, tokenizer, text_encoder)
+    cosine_sim = torch.nn.functional.cosine_similarity(Trigger_ids_end, tri_embedding, dim=2)
+    # print(cosine_sim.shape)
+    print(" cos simi(ori_trigger, train_trigger) = ")
+    print(cosine_sim)
 
-    
     tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
 
     Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
