@@ -24,6 +24,39 @@ from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNe
 if TYPE_CHECKING:
     from ..base.daam_module import DAAMModule
 
+
+# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+def _make_causal_mask(
+    input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min, device=device), device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+# Copied from transformers.models.bart.modeling_bart._expand_mask
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
+
 def normalize(sa):
     sa = (sa - sa.min()) / (sa.max() - sa.min())
     return sa
@@ -74,12 +107,17 @@ class BaseModelOutputWithPooling():
 class Embedding(nn.Module):
     def __init__(self, 
         max_position_embeddings=77,
+        layer_norm_eps=1e-5,
+        hidden_size=768,
         ):
         super().__init__()
+        
         self.register_buffer("position_ids", torch.arange(max_position_embeddings).expand((1, -1)))
 
     def trans_forward(
         self,
+        device,
+        text_encoder,
         trigger_ids: Optional[torch.Tensor]=  None,
         trigger_ebd: Optional[torch.Tensor]=  None,
         input_ids: Optional[torch.Tensor] = None,
@@ -88,9 +126,10 @@ class Embedding(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        hidden_size=512,
+        hidden_size=768,
         vocab_size=49408,
         max_position_embeddings=77,
+        layer_norm_eps=1e-5,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
 
         if input_ids is None:
@@ -106,7 +145,8 @@ class Embedding(nn.Module):
 
         # input_ids = torch.cat((trigger_ids[:,-1], input_ids[:,1:]), dim=1)
 
-        input_shape = input_ids.size()
+        input_shape = input_ids.unsqueeze(0).size()
+        # input_shape = ori_input_ids['input_ids'].size()
         input_ids = input_ids.view(-1, input_shape[-1])
         # tensor([[49406, 48136,   320,  2368,  2087,   525,   320,  1615, 49407]])
 
@@ -131,30 +171,35 @@ class Embedding(nn.Module):
         # ori_input_ids['input_ids'][0][1:] = ([  320,  2368,  2087,   525,   320,  1615, 49407])
 
         position_embeddings = position_embedding(position_ids)
-        embeddings = inputs_embeds + position_embeddings[0][2:]
-        # all_embedding = cat(trigger_ebd, embeddings)
-
-        # ====================================================================
         
+        embeddings = inputs_embeds + position_embeddings[0][2:]
+        emd = embeddings.to(device)
+        all_embedding = torch.cat((trigger_ebd[0][:-1], emd),dim=0).unsqueeze(0)
+        # 现在的问题在于这个如何把512的和768的对齐起来
+        hidden_states = all_embedding
+        # ====================================================================
+
         # CLIP's text model uses causal mask, prepare it here.
         # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
         causal_attention_mask = _make_causal_mask(input_shape, hidden_states.dtype, device=hidden_states.device)
         # expand attention_mask
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            attention_mask = _expand_mask(attention_mask, hidden_states.dtype)
-
-        encoder_outputs = self.encoder(
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            causal_attention_mask=causal_attention_mask,
+            attention_mask = _expand_mask(attention_mask.unsqueeze(0), hidden_states.dtype)
+        
+        #--------here
+        encoder_outputs = text_encoder.text_model.encoder(
+            inputs_embeds=hidden_states.to(device),
+            attention_mask=attention_mask.to(device),
+            causal_attention_mask=causal_attention_mask.to(device),
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
 
         last_hidden_state = encoder_outputs[0]
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = nn.LayerNorm(hidden_size, eps=layer_norm_eps, device=device)(last_hidden_state)
+        # last_hidden_state = self.final_layer_norm(last_hidden_state)
 
         # text_embeds.shape = [batch_size, sequence_length, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
@@ -228,15 +273,20 @@ def main():
     # -----------------------------Prepare trigger-----------------------------------
     Trigger = 'sks'
     tri_ids = tokenizer(Trigger, padding=padding, return_tensors="pt")
-    # text_embeddings = text_encoder(
-    #     tokens.input_ids.to(device), attention_mask=tokens.attention_mask.to(device)
-    # )
+    text_embeddings = text_encoder(
+        tri_ids.input_ids.to(device), attention_mask=tri_ids.attention_mask.to(device)
+    )
+    print("config:")
+    print(text_encoder.config_class)
 
     Token2Ebd = Embedding()
     ids = tokenizer("A cat stand on a car", padding=padding, return_tensors="pt")
     tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
-    all_embedding = Token2Ebd.trans_forward(trigger_ids=tri_ids, trigger_ebd=tri_embedding,input_ids=ids)
+    all_embedding = Token2Ebd.trans_forward(device = device, text_encoder = text_encoder, trigger_ids=tri_ids, trigger_ebd=tri_embedding,input_ids=ids)
 
+    text_ebd = encode_text("sks A cat stand on a car", device, tokenizer, text_encoder)
+
+    
     tri_embedding = encode_text(Trigger, device, tokenizer, text_encoder)
 
     Trigger_ids = tri_embedding.detach().clone().requires_grad_(True) 
